@@ -240,6 +240,113 @@ function del_dnat() {
     done
 }
 
+
+# example usage:
+# delete_tc_filter "1:0" "192.168.1.1" "src"
+function delete_tc_filter() {
+    qdisc_id=$1
+    v4ip=$2
+    direction=$3
+
+    # tc -p -s -d filter show dev net1 parent $qdisc_id
+    # filter protocol ip pref 10 u32 chain 0
+    # filter protocol ip pref 10 u32 chain 0 fh 800: ht divisor 1
+    # filter protocol ip pref 10 u32 chain 0 fh 800::800 order 2048 key ht 800 bkt 0 *flowid :1 not_in_hw
+    #   match IP dst 172.18.11.2/32
+    #  police 0x1 rate 10Mbit burst 10Mb mtu 2Kb action drop overhead 0b linklayer ethernet
+    #         ref 1 bind 1  installed 47118 sec used 47118 sec firstused 18113444 sec
+
+    #  Sent 0 bytes 0 pkts (dropped 0, overlimits 0)
+
+    # get the corresponding filterID by the EIP, and use the filterID to delete the corresponding filtering rule.
+    ipList=$(tc -p -s -d filter show dev net1 parent $qdisc_id | grep "match IP " | awk '{print $4}')
+    i=0
+    for line in $ipList; do
+        i=$((i+1))
+        if echo "$line" | grep $v4ip; then
+            result=$(tc -p -s -d filter show dev net1 parent $qdisc_id | grep "filter protocol ip pref [0-9]\+ u32 \(fh\|chain [0-9]\+ fh\) \(\w\+::\w\+\) *" | awk '{print $5,$10}' | sed -n $i"p")
+            arr=($result)
+            pref=${arr[0]}
+            filterID=${arr[1]}
+            exec_cmd "tc filter del dev net1 parent $qdisc_id protocol ip prio $pref handle $filterID u32"
+            break
+        fi
+    done
+}
+
+function eip_ingress_qos_add() {
+    # ingress: 
+    # external --> net1 --> qos -->
+    # dst ip is iptables eip on net1
+    for rule in $@
+    do
+        arr=(${rule//,/ })
+        v4ip=(${arr[0]//\// })
+        priority=${arr[1]}
+        rate=${arr[2]}
+        burst=${arr[3]}
+        direction="dst"
+        tc qdisc add dev net1 ingress 2>/dev/nul || true
+        # get qdisc id
+        qdisc_id=$(tc qdisc show dev net1 ingress | awk '{print $3}')
+        # del old filter
+        tc -p -s -d filter show dev net1 parent $qdisc_id | grep -w $v4ip
+        if [ "$?" -eq 0 ];then
+            delete_tc_filter $qdisc_id $v4ip $direction
+        fi
+        exec_cmd "tc filter add dev net1 parent $qdisc_id protocol ip prio $priority u32 match ip $direction $v4ip police rate "$rate"Mbit burst "$burst"Mb drop flowid :1"
+    done
+}
+
+function eip_egress_qos_add() {
+    # egress: 
+    # net1 --> qos --> external
+    # src ip is iptables eip on net1
+    for rule in $@
+    do
+        arr=(${rule//,/ })
+        v4ip=(${arr[0]//\// })
+        priority=${arr[1]}
+        rate=${arr[2]}
+        burst=${arr[3]}
+        qdisc_id="1:0"
+        direction="src"
+        tc qdisc add dev net1 root handle $qdisc_id htb 2>/dev/nul || true
+        # del old filter
+        tc -p -s -d filter show dev net1 parent $qdisc_id | grep -w $v4ip
+        if [ "$?" -eq 0 ];then
+            delete_tc_filter $qdisc_id $v4ip $direction
+        fi
+        exec_cmd "tc filter add dev net1 parent $qdisc_id protocol ip prio $priority u32 match ip $direction $v4ip police rate "$rate"Mbit burst "$burst"Mb drop flowid :1"
+    done
+}
+
+function eip_ingress_qos_del() {
+    for rule in $@
+    do
+        arr=(${rule//,/ })
+        v4ip=(${arr[0]//\// })
+        direction="dst"
+        qdisc_id=$(tc qdisc show dev net1 ingress | awk '{print $3}')
+        # if qdisc_id is empty, this means ingress qdisc is not added, so we don't need to delete filter.
+        if [ -n "$qdisc_id" ]; then
+            delete_tc_filter $qdisc_id $v4ip $direction
+        fi
+    done
+}
+
+function eip_egress_qos_del() {
+    for rule in $@
+    do
+        arr=(${rule//,/ })
+        v4ip=(${arr[0]//\// })
+        direction="src"
+        qdisc_id="1:0"
+        delete_tc_filter $qdisc_id $v4ip $direction
+    done
+}
+
+
 rules=${@:2:${#}}
 opt=$1
 case $opt in
@@ -298,6 +405,22 @@ case $opt in
  get-iptables-version)
         echo "get-iptables-version $rules"
         get_iptables_version $rules
+        ;;
+ eip-ingress-qos-add)
+        echo "eip-ingress-qos-add $rules"
+        eip_ingress_qos_add $rules
+        ;;
+ eip-egress-qos-add)
+        echo "eip-egress-qos-add $rules"
+        eip_egress_qos_add $rules
+        ;;
+ eip-ingress-qos-del)
+        echo "eip-ingress-qos-del $rules"
+        eip_ingress_qos_del $rules
+        ;;
+ eip-egress-qos-del)
+        echo "eip-egress-qos-del $rules"
+        eip_egress_qos_del $rules
         ;;
  *)
         echo "Usage: $0 [init|subnet-route-add|subnet-route-del|eip-add|eip-del|floating-ip-add|floating-ip-del|dnat-add|dnat-del|snat-add|snat-del] ..."

@@ -2,15 +2,14 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net"
 	"strings"
-	"time"
 
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/tools/cache"
@@ -48,7 +47,8 @@ func (c *Controller) enqueueUpdateIptablesEip(old, new interface{}) {
 	oldEip := old.(*kubeovnv1.IptablesEIP)
 	newEip := new.(*kubeovnv1.IptablesEIP)
 	if !newEip.DeletionTimestamp.IsZero() ||
-		oldEip.Status.Redo != newEip.Status.Redo {
+		oldEip.Status.Redo != newEip.Status.Redo ||
+		oldEip.Spec.QoSPolicy != newEip.Spec.QoSPolicy {
 		c.updateIptablesEipQueue.Add(key)
 	}
 	c.updateSubnetStatusQueue.Add(util.VpcExternalNet)
@@ -236,10 +236,6 @@ func (c *Controller) handleAddIptablesEip(key string) error {
 			return err
 		}
 	}
-	if err = c.patchEipIP(key, v4ip); err != nil {
-		klog.Errorf("failed to patch status for eip %s, %v", key, err)
-		return err
-	}
 	if eipV4Cidr, err = c.getEipV4Cidr(v4ip); err != nil {
 		klog.Errorf("failed to get eip cidr, err: %v", err)
 		return err
@@ -252,7 +248,14 @@ func (c *Controller) handleAddIptablesEip(key string) error {
 		klog.Errorf("failed to create eip '%s' in pod, %v", key, err)
 		return err
 	}
-	if err = c.createOrUpdateCrdEip(key, v4ip, v6ip, mac, cachedEip.Spec.NatGwDp); err != nil {
+
+	if cachedEip.Spec.QoSPolicy != "" {
+		if err = c.addEipQoS(cachedEip, v4ip); err != nil {
+			klog.Errorf("failed to add qos '%s' in pod, %v", key, err)
+			return err
+		}
+	}
+	if err = c.createOrUpdateCrdEip(key, v4ip, v6ip, mac, cachedEip.Spec.NatGwDp, cachedEip.Spec.QoSPolicy); err != nil {
 		klog.Errorf("failed to update eip %s, %v", key, err)
 		return err
 	}
@@ -270,33 +273,39 @@ func (c *Controller) handleResetIptablesEip(key string) error {
 	klog.V(3).Infof("handle reset eip %s", key)
 	var notUse bool
 	switch eip.Status.Nat {
-	case "fip":
+	case util.FipUsingEip:
 		notUse = true
-	case "dnat":
-		time.Sleep(10 * time.Second)
+	case util.DnatUsingEip:
 		// nat change eip not that fast
 		dnats, err := c.config.KubeOvnClient.KubeovnV1().IptablesDnatRules().List(context.Background(), metav1.ListOptions{
-			LabelSelector: fields.OneTermEqualSelector(util.VpcEipLabel, key).String(),
+			LabelSelector: fields.OneTermEqualSelector(util.VpcNatGatewayNameLabel, key).String(),
 		})
 		if err != nil {
 			klog.Errorf("failed to get dnats, %v", err)
 			return err
 		}
-		if len(dnats.Items) == 0 {
-			notUse = true
+		notUse = true
+		for _, item := range dnats.Items {
+			if item.Annotations[util.VpcEipAnnotation] == key {
+				notUse = false
+				break
+			}
 		}
-	case "snat":
-		time.Sleep(10 * time.Second)
+	case util.SnatUsingEip:
 		// nat change eip not that fast
 		snats, err := c.config.KubeOvnClient.KubeovnV1().IptablesSnatRules().List(context.Background(), metav1.ListOptions{
-			LabelSelector: fields.OneTermEqualSelector(util.VpcEipLabel, key).String(),
+			LabelSelector: fields.OneTermEqualSelector(util.VpcNatGatewayNameLabel, key).String(),
 		})
 		if err != nil {
 			klog.Errorf("failed to get snats, %v", err)
 			return err
 		}
-		if len(snats.Items) == 0 {
-			notUse = true
+		notUse = true
+		for _, item := range snats.Items {
+			if item.Annotations[util.VpcEipAnnotation] == key {
+				notUse = false
+				break
+			}
 		}
 	default:
 		notUse = true
@@ -339,6 +348,12 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 				return err
 			}
 		}
+		if cachedEip.Status.QoSPolicy != "" {
+			if err = c.delEipQoS(cachedEip, cachedEip.Status.IP); err != nil {
+				klog.Errorf("failed to del qos '%s' in pod, %v", key, err)
+				return err
+			}
+		}
 		if err = c.handleDelIptablesEipFinalizer(key); err != nil {
 			klog.Errorf("failed to handle del finalizer for eip %s, %v", key, err)
 			return err
@@ -358,6 +373,33 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 		klog.Error(err)
 		return err
 	}
+
+	// update qos
+	if cachedEip.Status.QoSPolicy != cachedEip.Spec.QoSPolicy {
+		if cachedEip.Status.QoSPolicy != "" {
+			if err = c.delEipQoS(cachedEip, cachedEip.Status.IP); err != nil {
+				klog.Errorf("failed to del qos '%s' in pod, %v", key, err)
+				return err
+			}
+		}
+		if cachedEip.Spec.QoSPolicy != "" {
+			if err = c.addEipQoS(cachedEip, cachedEip.Status.IP); err != nil {
+				klog.Errorf("failed to add qos '%s' in pod, %v", key, err)
+				return err
+			}
+		}
+
+		if err = c.qosLabelEIP(key, cachedEip.Spec.QoSPolicy); err != nil {
+			klog.Errorf("failed to label qos in eip, %v", err)
+			return err
+		}
+
+		if err = c.patchEipQoSStatus(key, cachedEip.Spec.QoSPolicy); err != nil {
+			klog.Errorf("failed to patch status for eip %s, %v", key, err)
+			return err
+		}
+	}
+
 	// redo
 	if !cachedEip.Status.Ready &&
 		cachedEip.Status.Redo != "" &&
@@ -377,7 +419,15 @@ func (c *Controller) handleUpdateIptablesEip(key string) error {
 			klog.Errorf("failed to create eip, %v", err)
 			return err
 		}
-		if err = c.patchEipStatus(key, "", "", "", true); err != nil {
+
+		if cachedEip.Spec.QoSPolicy != "" {
+			if err = c.addEipQoS(cachedEip, cachedEip.Status.IP); err != nil {
+				klog.Errorf("failed to add qos '%s' in pod, %v", key, err)
+				return err
+			}
+		}
+
+		if err = c.patchEipStatus(key, "", "", "", cachedEip.Spec.QoSPolicy, true); err != nil {
 			klog.Errorf("failed to patch status for eip %s, %v", key, err)
 			return err
 		}
@@ -434,6 +484,114 @@ func (c *Controller) deleteEipInPod(dp, v4Cidr string) error {
 	rule := v4Cidr
 	delRules = append(delRules, rule)
 	if err = c.execNatGwRules(gwPod, natGwEipDel, delRules); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Controller) addOrUpdateEIPBandtithLimitRules(eip *kubeovnv1.IptablesEIP, v4ip string, rules kubeovnv1.QoSPolicyBandwidthLimitRules) error {
+	var err error
+	for _, rule := range rules {
+		if err = c.addEipQoSInPod(eip.Spec.NatGwDp, v4ip, rule.Direction, rule.Priority, rule.RateMax, rule.BurstMax); err != nil {
+			klog.Errorf("failed to set ingress eip '%s' qos in pod, %v", eip.Name, err)
+			return err
+		}
+	}
+	return nil
+}
+
+// add tc rule for eip in nat gw pod
+func (c *Controller) addEipQoS(eip *kubeovnv1.IptablesEIP, v4ip string) error {
+	var err error
+	qosPolicy, err := c.config.KubeOvnClient.KubeovnV1().QoSPolicies().Get(context.Background(), eip.Spec.QoSPolicy, metav1.GetOptions{})
+	if !qosPolicy.Status.Shared {
+		eips, err := c.iptablesEipsLister.List(
+			labels.SelectorFromSet(labels.Set{util.QoSLabel: qosPolicy.Name}))
+		if err != nil {
+			klog.Errorf("failed to get eip list, %v", err)
+			return err
+		}
+		if len(eips) != 0 {
+			if eips[0].Name != eip.Name {
+				err := fmt.Errorf("not support unshared qos policy %s to related to multiple eip", eip.Spec.QoSPolicy)
+				klog.Error(err)
+				return err
+			}
+		}
+	}
+	if err != nil {
+		klog.Errorf("get qos policy %s failed: %v", eip.Spec.QoSPolicy, err)
+		return err
+	}
+	return c.addOrUpdateEIPBandtithLimitRules(eip, v4ip, qosPolicy.Status.BandwidthLimitRules)
+}
+
+func (c *Controller) delEIPBandtithLimitRules(eip *kubeovnv1.IptablesEIP, v4ip string, rules kubeovnv1.QoSPolicyBandwidthLimitRules) error {
+	var err error
+	for _, rule := range rules {
+		// del qos
+		if err = c.delEipQoSInPod(eip.Spec.NatGwDp, v4ip, rule.Direction); err != nil {
+			klog.Errorf("failed to del egress eip '%s' qos in pod, %v", eip.Name, err)
+			return err
+		}
+	}
+	return nil
+}
+
+// del tc rule for eip in nat gw pod
+func (c *Controller) delEipQoS(eip *kubeovnv1.IptablesEIP, v4ip string) error {
+	var err error
+	qosPolicy, err := c.config.KubeOvnClient.KubeovnV1().QoSPolicies().Get(context.Background(), eip.Status.QoSPolicy, metav1.GetOptions{})
+	if err != nil {
+		klog.Errorf("get qos policy %s failed: %v", eip.Status.QoSPolicy, err)
+		return err
+	}
+
+	return c.delEIPBandtithLimitRules(eip, v4ip, qosPolicy.Status.BandwidthLimitRules)
+}
+
+func (c *Controller) addEipQoSInPod(
+	dp string, v4ip string, direction kubeovnv1.QoSPolicyRuleDirection, priority int, rate string,
+	burst string) error {
+	var operation string
+	gwPod, err := c.getNatGwPod(dp)
+	if err != nil {
+		return err
+	}
+	var addRules []string
+	rule := fmt.Sprintf("%s,%d,%s,%s", v4ip, priority, rate, burst)
+	addRules = append(addRules, rule)
+
+	switch direction {
+	case kubeovnv1.DirectionIngress:
+		operation = natGwEipIngressQoSAdd
+	case kubeovnv1.DirectionEgress:
+		operation = natGwEipEgressQoSAdd
+	}
+
+	if err = c.execNatGwRules(gwPod, operation, addRules); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Controller) delEipQoSInPod(dp string, v4ip string, direction kubeovnv1.QoSPolicyRuleDirection) error {
+	var operation string
+	gwPod, err := c.getNatGwPod(dp)
+	if err != nil {
+		return err
+	}
+	var delRules []string
+	delRules = append(delRules, v4ip)
+
+	switch direction {
+	case kubeovnv1.DirectionIngress:
+		operation = natGwEipIngressQoSDel
+	case kubeovnv1.DirectionEgress:
+		operation = natGwEipEgressQoSDel
+	}
+
+	if err = c.execNatGwRules(gwPod, operation, delRules); err != nil {
 		return err
 	}
 	return nil
@@ -509,7 +667,7 @@ func (c *Controller) GetGwBySubnet(name string) (string, string, error) {
 	}
 }
 
-func (c *Controller) createOrUpdateCrdEip(key, v4ip, v6ip, mac, natGwDp string) error {
+func (c *Controller) createOrUpdateCrdEip(key, v4ip, v6ip, mac, natGwDp, qos string) error {
 	cachedEip, err := c.iptablesEipsLister.Get(key)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -542,12 +700,12 @@ func (c *Controller) createOrUpdateCrdEip(key, v4ip, v6ip, mac, natGwDp string) 
 		}
 	} else {
 		eip := cachedEip.DeepCopy()
-		if v4ip != "" && mac != "" {
+		if v4ip != "" {
 			klog.V(3).Infof("update eip cr %s", key)
-			eip.Spec.MacAddress = mac
 			eip.Spec.V4ip = v4ip
 			eip.Spec.V6ip = v6ip
 			eip.Spec.NatGwDp = natGwDp
+			eip.Spec.MacAddress = mac
 			if _, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Update(context.Background(), eip, metav1.UpdateOptions{}); err != nil {
 				errMsg := fmt.Errorf("failed to update eip crd %s, %v", key, err)
 				klog.Error(errMsg)
@@ -559,6 +717,7 @@ func (c *Controller) createOrUpdateCrdEip(key, v4ip, v6ip, mac, natGwDp string) 
 				// TODO:// ipv6
 			}
 			eip.Status.Ready = true
+			eip.Status.QoSPolicy = qos
 			bytes, err := eip.Status.Bytes()
 			if err != nil {
 				return err
@@ -572,33 +731,35 @@ func (c *Controller) createOrUpdateCrdEip(key, v4ip, v6ip, mac, natGwDp string) 
 				return err
 			}
 		}
-		var needUpdateLabel bool
+		var needUpdateLabel, needUpdateAnno bool
 		var op string
 		if len(eip.Labels) == 0 {
 			op = "add"
 			eip.Labels = map[string]string{
 				util.SubnetNameLabel:        util.VpcExternalNet,
 				util.VpcNatGatewayNameLabel: natGwDp,
-				util.VpcNatLabel:            "",
 			}
 			needUpdateLabel = true
 		} else if eip.Labels[util.SubnetNameLabel] != util.VpcExternalNet {
 			op = "replace"
 			eip.Labels[util.SubnetNameLabel] = util.VpcExternalNet
 			eip.Labels[util.VpcNatGatewayNameLabel] = natGwDp
-			eip.Labels[util.VpcNatLabel] = ""
 			needUpdateLabel = true
 		}
+		if eip.Spec.QoSPolicy != "" && eip.Labels[util.QoSLabel] != eip.Spec.QoSPolicy {
+			eip.Labels[util.QoSLabel] = eip.Spec.QoSPolicy
+		}
 		if needUpdateLabel {
-			patchPayloadTemplate := `[{ "op": "%s", "path": "/metadata/labels", "value": %s }]`
-			raw, _ := json.Marshal(eip.Labels)
-			patchPayload := fmt.Sprintf(patchPayloadTemplate, op, raw)
-			if _, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Patch(context.Background(), key, types.JSONPatchType,
-				[]byte(patchPayload), metav1.PatchOptions{}); err != nil {
-				if k8serrors.IsNotFound(err) {
-					return nil
-				}
-				klog.Errorf("failed to patch label for eip %s, %v", eip.Name, err)
+			if err := c.updateIptableLabels(eip.Name, op, "eip", eip.Labels); err != nil {
+				return err
+			}
+		}
+		if needUpdateAnno {
+			if eip.Annotations == nil {
+				eip.Annotations = make(map[string]string)
+			}
+			eip.Annotations[util.VpcNatAnnotation] = ""
+			if err := c.updateIptableAnnotations(eip.Name, op, "eip", eip.Annotations); err != nil {
 				return err
 			}
 		}
@@ -670,7 +831,8 @@ func (c *Controller) handleDelIptablesEipFinalizer(key string) error {
 	return nil
 }
 
-func (c *Controller) patchEipIP(key, v4ip string) error {
+func (c *Controller) patchEipQoSStatus(key, qos string) error {
+	var changed bool
 	oriEip, err := c.iptablesEipsLister.Get(key)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -679,23 +841,31 @@ func (c *Controller) patchEipIP(key, v4ip string) error {
 		return err
 	}
 	eip := oriEip.DeepCopy()
-	eip.Status.IP = v4ip
-	bytes, err := eip.Status.Bytes()
-	if err != nil {
-		return err
+
+	// update status.qosPolicy
+	if eip.Status.QoSPolicy != qos {
+		eip.Status.QoSPolicy = qos
+		changed = true
 	}
-	if _, err = c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Patch(context.Background(), key, types.MergePatchType,
-		bytes, metav1.PatchOptions{}, "status"); err != nil {
-		if k8serrors.IsNotFound(err) {
-			return nil
+
+	if changed {
+		bytes, err := eip.Status.Bytes()
+		if err != nil {
+			return err
 		}
-		klog.Errorf("failed to patch eip %s, %v", eip.Name, err)
-		return err
+		if _, err = c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Patch(context.Background(), key, types.MergePatchType,
+			bytes, metav1.PatchOptions{}, "status"); err != nil {
+			if k8serrors.IsNotFound(err) {
+				return nil
+			}
+			klog.Errorf("failed to patch eip %s, %v", eip.Name, err)
+			return err
+		}
 	}
 	return nil
 }
 
-func (c *Controller) patchEipStatus(key, v4ip, redo, nat string, ready bool) error {
+func (c *Controller) patchEipStatus(key, v4ip, redo, nat, qos string, ready bool) error {
 	oriEip, err := c.iptablesEipsLister.Get(key)
 	if err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -721,6 +891,11 @@ func (c *Controller) patchEipStatus(key, v4ip, redo, nat string, ready bool) err
 	}
 	if ready && nat != "" && eip.Status.Nat != nat {
 		eip.Status.Nat = nat
+		changed = true
+	}
+
+	if qos != "" && eip.Status.QoSPolicy != qos {
+		eip.Status.QoSPolicy = qos
 		changed = true
 	}
 
@@ -805,7 +980,7 @@ func (c *Controller) natLabelEip(eipName, natName string) error {
 		return err
 	}
 	eip := oriEip.DeepCopy()
-	var needUpdateLabel bool
+	var needUpdateLabel, needUpdateAnno bool
 	var op string
 	if len(eip.Labels) == 0 {
 		op = "add"
@@ -813,28 +988,65 @@ func (c *Controller) natLabelEip(eipName, natName string) error {
 		eip.Labels = map[string]string{
 			util.SubnetNameLabel:        util.VpcExternalNet,
 			util.VpcNatGatewayNameLabel: eip.Spec.NatGwDp,
-			util.VpcNatLabel:            natName,
 		}
-	} else if eip.Labels[util.VpcNatLabel] != natName {
+	} else if eip.Labels[util.VpcNatGatewayNameLabel] != eip.Spec.NatGwDp {
 		op = "replace"
 		needUpdateLabel = true
 		eip.Labels[util.SubnetNameLabel] = util.VpcExternalNet
 		eip.Labels[util.VpcNatGatewayNameLabel] = eip.Spec.NatGwDp
-		eip.Labels[util.VpcNatLabel] = natName
 	}
-
 	if needUpdateLabel {
-		patchPayloadTemplate := `[{ "op": "%s", "path": "/metadata/labels", "value": %s }]`
-		raw, _ := json.Marshal(eip.Labels)
-		patchPayload := fmt.Sprintf(patchPayloadTemplate, op, raw)
-		if _, err := c.config.KubeOvnClient.KubeovnV1().IptablesEIPs().Patch(context.Background(), eip.Name,
-			types.JSONPatchType, []byte(patchPayload), metav1.PatchOptions{}); err != nil {
-			if k8serrors.IsNotFound(err) {
-				return nil
-			}
-			klog.Errorf("failed to patch label for eip %s, %v", eip.Name, err)
+		if err := c.updateIptableLabels(eip.Name, op, "eip", eip.Labels); err != nil {
 			return err
 		}
 	}
+
+	if len(eip.Annotations) == 0 {
+		op = "add"
+		needUpdateAnno = true
+		eip.Annotations = map[string]string{
+			util.VpcNatAnnotation: natName,
+		}
+	} else if eip.Annotations[util.VpcNatAnnotation] != natName {
+		op = "replace"
+		needUpdateAnno = true
+		eip.Annotations[util.VpcNatAnnotation] = natName
+	}
+	if needUpdateAnno {
+		if err := c.updateIptableAnnotations(eip.Name, op, "eip", eip.Annotations); err != nil {
+			return err
+		}
+	}
+	return err
+}
+
+func (c *Controller) qosLabelEIP(eipName, qosName string) error {
+	oriEip, err := c.iptablesEipsLister.Get(eipName)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	eip := oriEip.DeepCopy()
+	var needUpdateLabel bool
+	var op string
+	if len(eip.Labels) == 0 {
+		op = "add"
+		needUpdateLabel = true
+		eip.Labels = map[string]string{
+			util.QoSLabel: qosName,
+		}
+	} else if eip.Labels[util.QoSLabel] != qosName {
+		op = "replace"
+		needUpdateLabel = true
+		eip.Labels[util.QoSLabel] = qosName
+	}
+	if needUpdateLabel {
+		if err := c.updateIptableLabels(eip.Name, op, "eip", eip.Labels); err != nil {
+			return err
+		}
+	}
+
 	return err
 }

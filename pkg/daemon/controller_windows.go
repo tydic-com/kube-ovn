@@ -17,8 +17,7 @@ import (
 )
 
 // ControllerRuntime represents runtime specific controller members
-type ControllerRuntime struct {
-}
+type ControllerRuntime struct{}
 
 func (c *Controller) initRuntime() error {
 	return nil
@@ -186,7 +185,7 @@ func (c *Controller) handlePod(key string) error {
 
 	// set default nic bandwidth
 	ifaceID := ovs.PodNameToPortName(podName, pod.Namespace, util.OvnProvider)
-	err = ovs.SetInterfaceBandwidth(podName, pod.Namespace, ifaceID, pod.Annotations[util.EgressRateAnnotation], pod.Annotations[util.IngressRateAnnotation], pod.Annotations[util.PriorityAnnotation])
+	err = ovs.SetInterfaceBandwidth(podName, pod.Namespace, ifaceID, pod.Annotations[util.EgressRateAnnotation], pod.Annotations[util.IngressRateAnnotation])
 	if err != nil {
 		return err
 	}
@@ -207,7 +206,7 @@ func (c *Controller) handlePod(key string) error {
 		}
 		if pod.Annotations[fmt.Sprintf(util.AllocatedAnnotationTemplate, provider)] == "true" {
 			ifaceID = ovs.PodNameToPortName(podName, pod.Namespace, provider)
-			err = ovs.SetInterfaceBandwidth(podName, pod.Namespace, ifaceID, pod.Annotations[fmt.Sprintf(util.EgressRateAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.IngressRateAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.PriorityAnnotationTemplate, provider)])
+			err = ovs.SetInterfaceBandwidth(podName, pod.Namespace, ifaceID, pod.Annotations[fmt.Sprintf(util.EgressRateAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.IngressRateAnnotationTemplate, provider)])
 			if err != nil {
 				return err
 			}
@@ -215,7 +214,7 @@ func (c *Controller) handlePod(key string) error {
 			if err != nil {
 				return err
 			}
-			err = ovs.SetNetemQos(podName, pod.Namespace, ifaceID, pod.Annotations[fmt.Sprintf(util.NetemQosLatencyAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.NetemQosLimitAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.NetemQosLossAnnotationTemplate, provider)])
+			err = ovs.SetNetemQos(podName, pod.Namespace, ifaceID, pod.Annotations[fmt.Sprintf(util.NetemQosLatencyAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.NetemQosLimitAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.NetemQosLossAnnotationTemplate, provider)], pod.Annotations[fmt.Sprintf(util.NetemQosJitterAnnotationTemplate, provider)])
 			if err != nil {
 				return err
 			}
@@ -228,12 +227,11 @@ func (c *Controller) loopEncapIpCheck() {
 	// TODO
 }
 
-func (c *Controller) clearQos(podName, podNamespace, ifaceID string) error {
+func rotateLog() {
 	// TODO
-	return nil
 }
 
-func rotateLog() {
+func (c *Controller) ovnMetricsUpdate() {
 	// TODO
 }
 

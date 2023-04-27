@@ -7,7 +7,7 @@ while :; do
   if [ $(kubectl get pod --no-headers -n kube-system -l app=kube-ovn-pinger | wc -l) -eq 0 ]; then
     break
   fi
-  sleep 5
+  sleep 1
 done
 
 set +e
@@ -74,9 +74,6 @@ for oeip in $(kubectl get oeip -o name); do
    kubectl delete --ignore-not-found $oeip
 done
 
-
-sleep 5
-
 # Delete Kube-OVN components
 kubectl delete --ignore-not-found deploy kube-ovn-monitor -n kube-system
 kubectl delete --ignore-not-found cm ovn-config ovn-ic-config ovn-external-gw-config -n kube-system
@@ -89,7 +86,7 @@ while :; do
   if [ $(kubectl get pod --no-headers -n kube-system -l app=kube-ovn-cni | wc -l) -eq 0 ]; then
     break
   fi
-  sleep 5
+  sleep 1
 done
 
 for pod in $(kubectl get pod -n kube-system -l app=ovs -o 'jsonpath={.items[?(@.status.phase=="Running")].metadata.name}'); do
@@ -116,7 +113,8 @@ kubectl delete --ignore-not-found crd htbqoses.kubeovn.io security-groups.kubeov
                                       vpc-nat-gateways.kubeovn.io vpcs.kubeovn.io vlans.kubeovn.io provider-networks.kubeovn.io \
                                       iptables-dnat-rules.kubeovn.io  iptables-eips.kubeovn.io  iptables-fip-rules.kubeovn.io \
                                       iptables-snat-rules.kubeovn.io vips.kubeovn.io switch-lb-rules.kubeovn.io vpc-dnses.kubeovn.io \
-                                      ovn-eips.kubeovn.io ovn-fips.kubeovn.io ovn-snat-rules.kubeovn.io 
+                                      ovn-eips.kubeovn.io ovn-fips.kubeovn.io ovn-snat-rules.kubeovn.io ovn-dnat-rules.kubeovn.io \
+                                      qos-policies.kubeovn.io
 
 # Remove annotations/labels in namespaces and nodes
 kubectl annotate no --all ovn.kubernetes.io/cidr-
@@ -147,7 +145,7 @@ kubectl annotate ns --all ovn.kubernetes.io/allocated-
 
 # ensure kube-ovn components have been deleted
 while :; do
-  sleep 5
+  sleep 1
   if [ $(kubectl get pod --no-headers -n kube-system -l component=network | wc -l) -eq 0 ]; then
     break
   fi

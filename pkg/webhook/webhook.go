@@ -42,14 +42,33 @@ func NewValidatingHook(c cache.Cache) (*ValidatingHook, error) {
 	createHooks[deploymentGVK] = v.DeploymentCreateHook
 	createHooks[statefulSetGVK] = v.StatefulSetCreateHook
 	createHooks[daemonSetGVK] = v.DaemonSetCreateHook
+	createHooks[cornJobSetGVK] = v.CornJobSetCreateHook
+	createHooks[jobSetGVK] = v.JobSetCreateHook
 	createHooks[podGVK] = v.PodCreateHook
+
 	createHooks[subnetGVK] = v.SubnetCreateHook
-
 	updateHooks[subnetGVK] = v.SubnetUpdateHook
-
 	deleteHooks[subnetGVK] = v.SubnetDeleteHook
+
+	createHooks[vpcGVK] = v.VpcCreateHook
+	updateHooks[vpcGVK] = v.VpcUpdateHook
 	deleteHooks[vpcGVK] = v.VpcDeleteHook
 
+	createHooks[vipGVK] = v.VipCreateHook
+	updateHooks[vipGVK] = v.VipUpdateHook
+
+	createHooks[vpcNatGatewayGVK] = v.VpcNatGwCreateOrUpdateHook
+	updateHooks[vpcNatGatewayGVK] = v.VpcNatGwCreateOrUpdateHook
+	deleteHooks[vpcNatGatewayGVK] = v.VpcNatGwDeleteHook
+	createHooks[iptablesEIPGVK] = v.iptablesEIPCreateHook
+	updateHooks[iptablesEIPGVK] = v.iptablesEIPUpdateHook
+	deleteHooks[iptablesEIPGVK] = v.iptablesEIPDeleteHook
+	createHooks[iptablesSnatRule] = v.iptablesSnatCreateHook
+	updateHooks[iptablesSnatRule] = v.iptablesSnatUpdateHook
+	createHooks[iptablesDnatRule] = v.iptablesDnatCreateHook
+	updateHooks[iptablesDnatRule] = v.iptablesDnatUpdateHook
+	createHooks[iptablesFIPRule] = v.iptablesFipCreateHook
+	updateHooks[iptablesFIPRule] = v.iptablesFipUpdateHook
 	return v, nil
 }
 

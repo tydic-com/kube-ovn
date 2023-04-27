@@ -43,6 +43,7 @@ type Configuration struct {
 	KubeOvnClient           clientset.Interface
 	NodeName                string
 	ServiceClusterIPRange   string
+	NodeSwitch              string
 	NodeLocalDnsIP          string
 	EncapChecksum           bool
 	EnablePprof             bool
@@ -73,6 +74,7 @@ func ParseFlags() *Configuration {
 		argOvsSocket             = pflag.String("ovs-socket", "", "The socket to local ovs-server")
 		argKubeConfigFile        = pflag.String("kubeconfig", "", "Path to kubeconfig file with authorization and master location information. If not set use the inCluster token.")
 		argServiceClusterIPRange = pflag.String("service-cluster-ip-range", "10.96.0.0/12", "The kubernetes service cluster ip range")
+		argNodeSwitch            = pflag.String("node-switch", "join", "The name of node gateway switch which help node to access pod network")
 		argNodeLocalDnsIP        = pflag.String("node-local-dns-ip", "", "If use nodelocaldns the local dns server ip should be set here.")
 		argEncapChecksum         = pflag.Bool("encap-checksum", true, "Enable checksum")
 		argEnablePprof           = pflag.Bool("enable-pprof", false, "Enable pprof")
@@ -125,6 +127,7 @@ func ParseFlags() *Configuration {
 		MacLearningFallback:     *argMacLearningFallback,
 		NodeName:                strings.ToLower(*argNodeName),
 		ServiceClusterIPRange:   *argServiceClusterIPRange,
+		NodeSwitch:              *argNodeSwitch,
 		NodeLocalDnsIP:          *argNodeLocalDnsIP,
 		EncapChecksum:           *argEncapChecksum,
 		NetworkType:             *argsNetworkType,
@@ -201,6 +204,10 @@ func (config *Configuration) initNicConfig(nicBridgeMappings map[string]string) 
 			klog.Errorf("failed to find iface %s, %v", tunnelNic, err)
 			return err
 		}
+		srcIPs, err := getSrcIPsByRoutes(iface)
+		if err != nil {
+			return fmt.Errorf("failed to get src IPs by routes on interface %s: %v", iface.Name, err)
+		}
 		addrs, err := iface.Addrs()
 		if err != nil {
 			return fmt.Errorf("failed to get iface addr. %v", err)
@@ -210,14 +217,16 @@ func (config *Configuration) initNicConfig(nicBridgeMappings map[string]string) 
 			if ip := net.ParseIP(ipStr); ip == nil || ip.IsLinkLocalUnicast() {
 				continue
 			}
-			encapIP = ipStr
-			break
+			if len(srcIPs) == 0 || util.ContainsString(srcIPs, ipStr) {
+				encapIP = ipStr
+				break
+			}
 		}
 		if len(encapIP) == 0 {
 			return fmt.Errorf("iface %s has no valid IP address", tunnelNic)
 		}
 
-		klog.Infof("use %s as tunnel interface", iface.Name)
+		klog.Infof("use %s on %s as tunnel address", encapIP, iface.Name)
 		mtu = iface.MTU
 		config.tunnelIface = iface.Name
 	}
@@ -316,6 +325,13 @@ func (config *Configuration) initKubeClient() error {
 			return err
 		}
 	}
+
+	// try to connect to apiserver's tcp port
+	if err = util.DialApiServer(cfg.Host); err != nil {
+		klog.Errorf("failed to dial apiserver: %v", err)
+		return err
+	}
+
 	cfg.QPS = 1000
 	cfg.Burst = 2000
 

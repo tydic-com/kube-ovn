@@ -15,7 +15,9 @@ import (
 
 	kubeovnv1 "github.com/kubeovn/kube-ovn/pkg/apis/kubeovn/v1"
 	"github.com/kubeovn/kube-ovn/pkg/ovs"
+	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
 	"github.com/kubeovn/kube-ovn/pkg/util"
+	"github.com/ovn-org/libovsdb/ovsdb"
 )
 
 var lastNoPodLSP map[string]bool
@@ -52,25 +54,16 @@ func (c *Controller) gcLogicalRouterPort() error {
 		return err
 	}
 
-	var exceptPeerPorts []string
+	exceptPeerPorts := make(map[string]struct{})
 	for _, vpc := range vpcs {
 		for _, peer := range vpc.Status.VpcPeerings {
-			exceptPeerPorts = append(exceptPeerPorts, fmt.Sprintf("%s-%s", vpc.Name, peer))
+			exceptPeerPorts[fmt.Sprintf("%s-%s", vpc.Name, peer)] = struct{}{}
 		}
 	}
-	lrps, err := c.ovnLegacyClient.ListLogicalEntity("logical_router_port", "peer!=[]")
-	if err != nil {
-		klog.Errorf("failed to list logical router port, %v", err)
+
+	if err = c.ovnClient.DeleteLogicalRouterPorts(nil, logicalRouterPortFilter(exceptPeerPorts)); err != nil {
+		klog.Errorf("delete non-existent peer logical router port: %v", err)
 		return err
-	}
-	for _, lrp := range lrps {
-		if !util.ContainsString(exceptPeerPorts, lrp) {
-			klog.Infof("gc logical router port %s", lrp)
-			if err = c.ovnLegacyClient.DeleteLogicalRouterPort(lrp); err != nil {
-				klog.Errorf("failed to delete logical router port %s, %v", lrp, err)
-				return err
-			}
-		}
 	}
 	return nil
 }
@@ -132,25 +125,27 @@ func (c *Controller) gcLogicalSwitch() error {
 		subnetMap[s.Name] = s
 		subnetNames = append(subnetNames, s.Name)
 	}
-	lss, err := c.ovnLegacyClient.ListLogicalSwitch(c.config.EnableExternalVpc)
+
+	lss, err := c.ovnClient.ListLogicalSwitch(c.config.EnableExternalVpc, nil)
 	if err != nil {
-		klog.Errorf("failed to list logical switch, %v", err)
+		klog.Errorf("list logical switch: %v", err)
 		return err
 	}
+
 	klog.Infof("ls in ovn %v", lss)
 	klog.Infof("subnet in kubernetes %v", subnetNames)
 	for _, ls := range lss {
-		if ls == util.InterconnectionSwitch ||
-			ls == util.ExternalGatewaySwitch ||
-			ls == c.config.ExternalGatewaySwitch {
+		if ls.Name == util.InterconnectionSwitch ||
+			ls.Name == util.ExternalGatewaySwitch ||
+			ls.Name == c.config.ExternalGatewaySwitch {
 			continue
 		}
-		if s := subnetMap[ls]; s != nil && isOvnSubnet(s) {
+		if s := subnetMap[ls.Name]; s != nil && isOvnSubnet(s) {
 			continue
 		}
 
 		klog.Infof("gc subnet %s", ls)
-		if err := c.handleDeleteLogicalSwitch(ls); err != nil {
+		if err := c.handleDeleteLogicalSwitch(ls.Name); err != nil {
 			klog.Errorf("failed to gc subnet %s, %v", ls, err)
 			return err
 		}
@@ -190,20 +185,23 @@ func (c *Controller) gcCustomLogicalRouter() error {
 	for _, s := range vpcs {
 		vpcNames = append(vpcNames, s.Name)
 	}
-	lrs, err := c.ovnLegacyClient.ListLogicalRouter(c.config.EnableExternalVpc)
+
+	lrs, err := c.ovnClient.ListLogicalRouter(c.config.EnableExternalVpc, nil)
 	if err != nil {
 		klog.Errorf("failed to list logical router, %v", err)
 		return err
 	}
+
 	klog.Infof("lr in ovn %v", lrs)
 	klog.Infof("vpc in kubernetes %v", vpcNames)
+
 	for _, lr := range lrs {
-		if lr == util.DefaultVpc {
+		if lr.Name == util.DefaultVpc {
 			continue
 		}
-		if !util.IsStringIn(lr, vpcNames) {
+		if !util.IsStringIn(lr.Name, vpcNames) {
 			klog.Infof("gc router %s", lr)
-			if err := c.deleteVpcRouter(lr); err != nil {
+			if err := c.deleteVpcRouter(lr.Name); err != nil {
 				klog.Errorf("failed to delete router %s, %v", lr, err)
 				return err
 			}
@@ -327,6 +325,11 @@ func (c *Controller) markAndCleanLSP() error {
 		if node.Annotations[util.AllocatedAnnotation] == "true" {
 			ipMap[fmt.Sprintf("node-%s", node.Name)] = struct{}{}
 		}
+
+		if _, err := c.ovnEipsLister.Get(node.Name); err == nil {
+			// node external gw lsp is managed by ovn eip cr, skip gc its lsp
+			ipMap[node.Name] = struct{}{}
+		}
 	}
 
 	// The lsp for vm pod should not be deleted if vm still exists
@@ -335,7 +338,7 @@ func (c *Controller) markAndCleanLSP() error {
 		ipMap[vmLsp] = struct{}{}
 	}
 
-	lsps, err := c.ovnClient.ListLogicalSwitchPorts(c.config.EnableExternalVpc, nil)
+	lsps, err := c.ovnClient.ListNormalLogicalSwitchPorts(c.config.EnableExternalVpc, nil)
 	if err != nil {
 		klog.Errorf("failed to list logical switch port, %v", err)
 		return err
@@ -354,10 +357,11 @@ func (c *Controller) markAndCleanLSP() error {
 		}
 
 		klog.Infof("gc logical switch port %s", lsp.Name)
-		if err := c.ovnLegacyClient.DeleteLogicalSwitchPort(lsp.Name); err != nil {
-			klog.Errorf("failed to delete lsp %s, %v", lsp, err)
+		if err := c.ovnClient.DeleteLogicalSwitchPort(lsp.Name); err != nil {
+			klog.Errorf("failed to delete lsp %s: %v", lsp.Name, err)
 			return err
 		}
+
 		if err := c.config.KubeOvnClient.KubeovnV1().IPs().Delete(context.Background(), lsp.Name, metav1.DeleteOptions{}); err != nil {
 			if !k8serrors.IsNotFound(err) {
 				klog.Errorf("failed to delete ip %s, %v", lsp.Name, err)
@@ -402,13 +406,8 @@ func (c *Controller) gcLoadBalancer() error {
 					continue
 				}
 
-				err = c.ovnLegacyClient.RemoveLbFromLogicalSwitch(
-					vpc.Status.TcpLoadBalancer,
-					vpc.Status.TcpSessionLoadBalancer,
-					vpc.Status.UdpLoadBalancer,
-					vpc.Status.UdpSessionLoadBalancer,
-					subnetName)
-				if err != nil {
+				lbs := []string{vpc.Status.TcpLoadBalancer, vpc.Status.TcpSessionLoadBalancer, vpc.Status.UdpLoadBalancer, vpc.Status.UdpSessionLoadBalancer, vpc.Status.SctpLoadBalancer, vpc.Status.SctpSessionLoadBalancer}
+				if err := c.ovnClient.LogicalSwitchUpdateLoadBalancers(subnetName, ovsdb.MutateOperationDelete, lbs...); err != nil {
 					return err
 				}
 			}
@@ -417,6 +416,8 @@ func (c *Controller) gcLoadBalancer() error {
 			vpc.Status.TcpSessionLoadBalancer = ""
 			vpc.Status.UdpLoadBalancer = ""
 			vpc.Status.UdpSessionLoadBalancer = ""
+			vpc.Status.SctpLoadBalancer = ""
+			vpc.Status.SctpSessionLoadBalancer = ""
 			bytes, err := vpc.Status.Bytes()
 			if err != nil {
 				return err
@@ -427,14 +428,9 @@ func (c *Controller) gcLoadBalancer() error {
 			}
 		}
 
-		// delete
-		ovnLbs, err := c.ovnLegacyClient.ListLoadBalancer()
-		if err != nil {
-			klog.Errorf("failed to list load balancer, %v", err)
-			return err
-		}
-		if err = c.ovnLegacyClient.DeleteLoadBalancer(ovnLbs...); err != nil {
-			klog.Errorf("failed to delete load balancer, %v", err)
+		// lbs will remove from logical switch automatically when delete lbs
+		if err = c.ovnClient.DeleteLoadBalancers(nil); err != nil {
+			klog.Errorf("delete all load balancers: %v", err)
 			return err
 		}
 		return nil
@@ -445,27 +441,40 @@ func (c *Controller) gcLoadBalancer() error {
 		klog.Errorf("failed to list svc, %v", err)
 		return err
 	}
-	tcpVips := []string{}
-	udpVips := []string{}
-	tcpSessionVips := []string{}
-	udpSessionVips := []string{}
+	tcpVips := make(map[string]struct{}, len(svcs)*2)
+	udpVips := make(map[string]struct{}, len(svcs)*2)
+	sctpVips := make(map[string]struct{}, len(svcs)*2)
+	tcpSessionVips := make(map[string]struct{}, len(svcs)*2)
+	udpSessionVips := make(map[string]struct{}, len(svcs)*2)
+	sctpSessionVips := make(map[string]struct{}, len(svcs)*2)
 	for _, svc := range svcs {
-		ip := svc.Spec.ClusterIP
+		ips := util.ServiceClusterIPs(*svc)
 		if v, ok := svc.Annotations[util.SwitchLBRuleVipsAnnotation]; ok {
-			ip = v
+			ips = strings.Split(v, ",")
 		}
-		for _, port := range svc.Spec.Ports {
-			if port.Protocol == corev1.ProtocolTCP {
-				if svc.Spec.SessionAffinity == corev1.ServiceAffinityClientIP {
-					tcpSessionVips = append(tcpSessionVips, fmt.Sprintf("%s:%d", ip, port.Port))
-				} else {
-					tcpVips = append(tcpVips, fmt.Sprintf("%s:%d", ip, port.Port))
-				}
-			} else {
-				if svc.Spec.SessionAffinity == corev1.ServiceAffinityClientIP {
-					udpSessionVips = append(udpSessionVips, fmt.Sprintf("%s:%d", ip, port.Port))
-				} else {
-					udpVips = append(udpVips, fmt.Sprintf("%s:%d", ip, port.Port))
+
+		for _, ip := range ips {
+			for _, port := range svc.Spec.Ports {
+				vip := util.JoinHostPort(ip, port.Port)
+				switch port.Protocol {
+				case corev1.ProtocolTCP:
+					if svc.Spec.SessionAffinity == corev1.ServiceAffinityClientIP {
+						tcpSessionVips[vip] = struct{}{}
+					} else {
+						tcpVips[vip] = struct{}{}
+					}
+				case corev1.ProtocolUDP:
+					if svc.Spec.SessionAffinity == corev1.ServiceAffinityClientIP {
+						udpSessionVips[vip] = struct{}{}
+					} else {
+						udpVips[vip] = struct{}{}
+					}
+				case corev1.ProtocolSCTP:
+					if svc.Spec.SessionAffinity == corev1.ServiceAffinityClientIP {
+						sctpSessionVips[vip] = struct{}{}
+					} else {
+						sctpVips[vip] = struct{}{}
+					}
 				}
 			}
 		}
@@ -478,120 +487,68 @@ func (c *Controller) gcLoadBalancer() error {
 	}
 	var vpcLbs []string
 	for _, vpc := range vpcs {
-		tcpLb, udpLb := vpc.Status.TcpLoadBalancer, vpc.Status.UdpLoadBalancer
-		tcpSessLb, udpSessLb := vpc.Status.TcpSessionLoadBalancer, vpc.Status.UdpSessionLoadBalancer
-		vpcLbs = append(vpcLbs, tcpLb, udpLb, tcpSessLb, udpSessLb)
+		tcpLb, udpLb, sctpLb := vpc.Status.TcpLoadBalancer, vpc.Status.UdpLoadBalancer, vpc.Status.SctpLoadBalancer
+		tcpSessLb, udpSessLb, sctpSessLb := vpc.Status.TcpSessionLoadBalancer, vpc.Status.UdpSessionLoadBalancer, vpc.Status.SctpSessionLoadBalancer
+		vpcLbs = append(vpcLbs, tcpLb, udpLb, sctpLb, tcpSessLb, udpSessLb, sctpSessLb)
 
-		if tcpLb != "" {
-			lbUuid, err := c.ovnLegacyClient.FindLoadbalancer(tcpLb)
-			if err != nil {
-				klog.Errorf("failed to get lb %v", err)
+		removeVIP := func(lbName string, svcVips map[string]struct{}) error {
+			if lbName == "" {
+				return nil
 			}
-			vips, err := c.ovnLegacyClient.GetLoadBalancerVips(lbUuid)
+
+			lb, err := c.ovnClient.GetLoadBalancer(lbName, false)
 			if err != nil {
-				klog.Errorf("failed to get tcp lb vips %v", err)
+				klog.Errorf("get LB %s: %v", lbName, err)
 				return err
 			}
-			for vip := range vips {
-				if !util.IsStringIn(vip, tcpVips) {
-					err := c.ovnLegacyClient.DeleteLoadBalancerVip(vip, tcpLb)
-					if err != nil {
-						klog.Errorf("failed to delete vip %s from tcp lb %s, %v", vip, tcpLb, err)
+
+			for vip := range lb.Vips {
+				if _, ok := svcVips[vip]; !ok {
+					if err = c.ovnClient.LoadBalancerDeleteVip(lbName, vip); err != nil {
+						klog.Errorf("failed to delete vip %s from LB %s: %v", vip, lbName, err)
 						return err
 					}
 				}
 			}
+			return nil
 		}
 
-		if tcpSessLb != "" {
-			lbUuid, err := c.ovnLegacyClient.FindLoadbalancer(tcpSessLb)
-			if err != nil {
-				klog.Errorf("failed to get lb %v", err)
-			}
-			vips, err := c.ovnLegacyClient.GetLoadBalancerVips(lbUuid)
-			if err != nil {
-				klog.Errorf("failed to get tcp session lb vips %v", err)
-				return err
-			}
-			for vip := range vips {
-				if !util.IsStringIn(vip, tcpSessionVips) {
-					err := c.ovnLegacyClient.DeleteLoadBalancerVip(vip, tcpSessLb)
-					if err != nil {
-						klog.Errorf("failed to delete vip %s from tcp session lb %s, %v", vip, tcpSessLb, err)
-						return err
-					}
-				}
-			}
+		if err = removeVIP(tcpLb, tcpVips); err != nil {
+			return err
 		}
-
-		if udpLb != "" {
-			lbUuid, err := c.ovnLegacyClient.FindLoadbalancer(udpLb)
-			if err != nil {
-				klog.Errorf("failed to get lb %v", err)
-				return err
-			}
-			vips, err := c.ovnLegacyClient.GetLoadBalancerVips(lbUuid)
-			if err != nil {
-				klog.Errorf("failed to get udp lb vips %v", err)
-				return err
-			}
-			for vip := range vips {
-				if !util.IsStringIn(vip, udpVips) {
-					err := c.ovnLegacyClient.DeleteLoadBalancerVip(vip, udpLb)
-					if err != nil {
-						klog.Errorf("failed to delete vip %s from tcp lb %s, %v", vip, udpLb, err)
-						return err
-					}
-				}
-			}
+		if err = removeVIP(tcpSessLb, tcpSessionVips); err != nil {
+			return err
 		}
-
-		if udpSessLb != "" {
-			lbUuid, err := c.ovnLegacyClient.FindLoadbalancer(udpSessLb)
-			if err != nil {
-				klog.Errorf("failed to get lb %v", err)
-				return err
-			}
-			vips, err := c.ovnLegacyClient.GetLoadBalancerVips(lbUuid)
-			if err != nil {
-				klog.Errorf("failed to get udp session lb vips %v", err)
-				return err
-			}
-			for vip := range vips {
-				if !util.IsStringIn(vip, udpSessionVips) {
-					err := c.ovnLegacyClient.DeleteLoadBalancerVip(vip, udpSessLb)
-					if err != nil {
-						klog.Errorf("failed to delete vip %s from udp session lb %s, %v", vip, udpSessLb, err)
-						return err
-					}
-				}
-			}
+		if err = removeVIP(udpLb, udpVips); err != nil {
+			return err
 		}
-	}
-
-	ovnLbs, err := c.ovnLegacyClient.ListLoadBalancer()
-	if err != nil {
-		klog.Errorf("failed to list load balancer, %v", err)
-		return err
-	}
-
-	klog.Infof("vpcLbs: %v", vpcLbs)
-	klog.Infof("ovnLbs: %v", ovnLbs)
-	for _, lb := range ovnLbs {
-		if util.ContainsString(vpcLbs, lb) {
-			continue
+		if err = removeVIP(udpSessLb, udpSessionVips); err != nil {
+			return err
 		}
-		klog.Infof("start to destroy load balancer %s", lb)
-		if err := c.ovnLegacyClient.DeleteLoadBalancer(lb); err != nil {
+		if err = removeVIP(sctpLb, sctpVips); err != nil {
+			return err
+		}
+		if err = removeVIP(sctpSessLb, sctpSessionVips); err != nil {
 			return err
 		}
 	}
+
+	// delete lbs
+	if err = c.ovnClient.DeleteLoadBalancers(func(lb *ovnnb.LoadBalancer) bool {
+		return !util.ContainsString(vpcLbs, lb.Name)
+	}); err != nil {
+		klog.Errorf("delete load balancers: %v", err)
+		return err
+	}
+
 	return nil
 }
 
 func (c *Controller) gcPortGroup() error {
 	klog.Infof("start to gc network policy")
-	var npNames []string
+
+	npNames := make(map[string]struct{})
+
 	if c.config.EnableNP {
 		nps, err := c.npsLister.List(labels.Everything())
 		if err != nil {
@@ -599,18 +556,19 @@ func (c *Controller) gcPortGroup() error {
 			return err
 		}
 
-		npNames = make([]string, 0, len(nps))
 		for _, np := range nps {
-			npNames = append(npNames, fmt.Sprintf("%s/%s", np.Namespace, np.Name))
+			npNames[fmt.Sprintf("%s/%s", np.Namespace, np.Name)] = struct{}{}
 		}
+
 		// append node port group to npNames to avoid gc node port group
 		nodes, err := c.nodesLister.List(labels.Everything())
 		if err != nil {
 			klog.Errorf("failed to list nodes, %v", err)
 			return err
 		}
+
 		for _, node := range nodes {
-			npNames = append(npNames, fmt.Sprintf("%s/%s", "node", node.Name))
+			npNames[fmt.Sprintf("%s/%s", "node", node.Name)] = struct{}{}
 		}
 
 		// append overlay subnets port group to npNames to avoid gc distributed subnets port group
@@ -623,22 +581,30 @@ func (c *Controller) gcPortGroup() error {
 			if subnet.Spec.Vpc != util.DefaultVpc || (subnet.Spec.Vlan != "" && !subnet.Spec.LogicalGateway) || subnet.Name == c.config.NodeSwitch || subnet.Spec.GatewayType != kubeovnv1.GWDistributedType {
 				continue
 			}
+
 			for _, node := range nodes {
-				npNames = append(npNames, fmt.Sprintf("%s/%s", subnet.Name, node.Name))
+				npNames[fmt.Sprintf("%s/%s", subnet.Name, node.Name)] = struct{}{}
 			}
 		}
 	}
 
-	pgs, err := c.ovnLegacyClient.ListNpPortGroup()
+	// list all np port groups which externalIDs[np]!=""
+	pgs, err := c.ovnClient.ListPortGroups(map[string]string{networkPolicyKey: ""})
 	if err != nil {
-		klog.Errorf("failed to list port-group, %v", err)
+		klog.Errorf("list np port group: %v", err)
 		return err
 	}
+
 	for _, pg := range pgs {
-		if !c.config.EnableNP || !util.IsStringIn(fmt.Sprintf("%s/%s", pg.NpNamespace, pg.NpName), npNames) {
+		np := strings.Split(pg.ExternalIDs[networkPolicyKey], "/")
+		npNamespace := np[0]
+		npName := np[1]
+
+		if _, ok := npNames[fmt.Sprintf("%s/%s", npNamespace, npName)]; !c.config.EnableNP || !ok {
 			klog.Infof("gc port group %s", pg.Name)
-			if err := c.handleDeleteNp(fmt.Sprintf("%s/%s", pg.NpNamespace, pg.NpName)); err != nil {
-				klog.Errorf("failed to gc np %s/%s, %v", pg.NpNamespace, pg.NpName, err)
+
+			if err := c.handleDeleteNp(fmt.Sprintf("%s/%s", npNamespace, npName)); err != nil {
+				klog.Errorf("gc np %s/%s, %v", npNamespace, npName, err)
 				return err
 			}
 		}
@@ -751,6 +717,17 @@ func (c *Controller) getVmLsps() []string {
 			for _, vm := range vms.Items {
 				vmLsp := ovs.PodNameToPortName(vm.Name, ns.Name, util.OvnProvider)
 				vmLsps = append(vmLsps, vmLsp)
+
+				attachNets, err := util.ParsePodNetworkAnnotation(vm.Spec.Template.ObjectMeta.Annotations[util.AttachmentNetworkAnnotation], vm.Namespace)
+				if err != nil {
+					klog.Errorf("failed to get attachment subnet of vm %s, %v", vm.Name, err)
+					continue
+				}
+				for _, multiNet := range attachNets {
+					provider := fmt.Sprintf("%s.%s.ovn", multiNet.Name, multiNet.Namespace)
+					vmLsp := ovs.PodNameToPortName(vm.Name, ns.Name, provider)
+					vmLsps = append(vmLsps, vmLsp)
+				}
 			}
 		}
 	}
@@ -866,4 +843,14 @@ func (c *Controller) gcVpcDns() error {
 		}
 	}
 	return nil
+}
+
+func logicalRouterPortFilter(exceptPeerPorts map[string]struct{}) func(lrp *ovnnb.LogicalRouterPort) bool {
+	return func(lrp *ovnnb.LogicalRouterPort) bool {
+		if _, ok := exceptPeerPorts[lrp.Name]; ok {
+			return false // ignore except lrp
+		}
+
+		return lrp.Peer != nil && len(*lrp.Peer) != 0
+	}
 }
